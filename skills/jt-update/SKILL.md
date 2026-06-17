@@ -65,6 +65,17 @@ Read `<TICKETS_DIR>/INDEX.md`. Find the row for `<ID>` and update:
 - The **Status** column if changed
 - The **Last Session** column to today's date
 
+## Archive if the ticket is now done
+
+If the new Status is one of `archived`, `closed`, `done`, `cancelled`, `completed`, `duplicate` (case-insensitive) AND the ticket dir is not already under `completed/`, move it:
+
+```bash
+mkdir -p "<TICKETS_DIR>/completed"
+mv "<TICKETS_DIR>/<ID>" "<TICKETS_DIR>/completed/<ID>"
+```
+
+Also remove the ticket's row from `<TICKETS_DIR>/INDEX.md` (active list). The completed ticket is still accessible via `jt open <ID>` and `jt ls --all`.
+
 ## Save session for resume
 
 Find the session file by ID (its project dir may differ from `pwd`) and read the real `cwd` from the JSONL so `jt open` resumes from the right project:
