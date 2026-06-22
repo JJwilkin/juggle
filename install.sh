@@ -16,7 +16,7 @@ CODEX_SKILLS_DIR="${CODEX_HOME:-${HOME}/.codex}/skills"
 BIN_DIR="${JUGGLE_BIN_DIR:-${HOME}/.local/bin}"
 JT_CONFIG="${HOME}/.jt-config"
 DEFAULT_TICKETS_DIR="${HOME}/juggle-task"
-SKILLS=(jt-init jt-update jt-open jt-project-init jt-sync)
+SKILLS=(jt-init jt-update jt-open jt-ls jt-project-init jt-sync)
 
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
