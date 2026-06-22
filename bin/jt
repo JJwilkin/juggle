@@ -311,7 +311,7 @@ Usage:
   jt config set <path>                   set tickets directory
   jt help                                show this message
 
-Skills (installed for both engines): /jt-init, /jt-update, /jt-project-init, /jt-sync
+Skills (installed for both engines): /jt-init, /jt-update, /jt-open, /jt-project-init, /jt-sync
 
 Docs: https://github.com/JJwilkin/juggle-task
 EOF
