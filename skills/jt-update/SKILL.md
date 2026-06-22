@@ -78,12 +78,24 @@ Also remove the ticket's row from `<TICKETS_DIR>/INDEX.md` (active list). The co
 
 ## Save session for resume
 
-Find the session file by ID (its project dir may differ from `pwd`) and read the real `cwd` from the JSONL so `jt open` resumes from the right project:
+Find the session rollout by ID across whichever engine (Claude Code or Codex) is running, read its real `cwd` from the JSONL, and write a 3-line `.session` file so `jt open` resumes from the right project with the right CLI.
 
 ```bash
-SESSION_ID="$CLAUDE_CODE_SESSION_ID"
+ENGINE=""
+SESSION_ID=""
+if [[ -n "${CLAUDE_CODE_SESSION_ID:-}" ]]; then
+  ENGINE="claude"; SESSION_ID="$CLAUDE_CODE_SESSION_ID"
+elif [[ -n "${CODEX_THREAD_ID:-}" ]]; then
+  ENGINE="codex";  SESSION_ID="$CODEX_THREAD_ID"
+fi
+
 if [[ -n "$SESSION_ID" ]]; then
-  SESSION_FILE=$(find "$HOME/.claude/projects" -maxdepth 2 -name "${SESSION_ID}.jsonl" -type f 2>/dev/null | head -1)
+  if [[ "$ENGINE" == "claude" ]]; then
+    SESSION_FILE=$(find "$HOME/.claude/projects" -maxdepth 2 -name "${SESSION_ID}.jsonl" -type f 2>/dev/null | head -1)
+  else
+    SESSION_FILE=$(find "${CODEX_HOME:-$HOME/.codex}/sessions" -name "rollout-*${SESSION_ID}.jsonl" -type f 2>/dev/null | head -1)
+  fi
+
   SESSION_DIR=""
   if [[ -f "$SESSION_FILE" ]]; then
     SESSION_DIR=$(python3 -c "
@@ -92,12 +104,13 @@ with open('$SESSION_FILE') as f:
     for line in f:
         try:
             d = json.loads(line)
-            if 'cwd' in d:
-                print(d['cwd']); break
+            cwd = d.get('cwd') or d.get('payload', {}).get('cwd')
+            if cwd:
+                print(cwd); break
         except: pass" 2>/dev/null)
   fi
   [[ -z "$SESSION_DIR" ]] && SESSION_DIR="$(pwd)"
-  printf '%s\n%s\n' "$SESSION_DIR" "$SESSION_ID" > "<TICKETS_DIR>/<ID>/.session"
+  printf '%s\n%s\n%s\n' "$ENGINE" "$SESSION_DIR" "$SESSION_ID" > "<TICKETS_DIR>/<ID>/.session"
 fi
 ```
 

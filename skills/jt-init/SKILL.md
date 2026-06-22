@@ -250,31 +250,50 @@ Check which case applies:
 
 If `REPO_ROOT` is `(not in a git repo)`, skip this step and note it in the report.
 
-### 10. Rename this Claude session and save session for resume
+### 10. Rename this session and save session for resume
 
-Append an `ai-title` record to the session file so the chat is named after the ticket, and save the session's actual project dir + ID so `jt open` can resume it later.
+Save the active session's project dir + UUID + engine so `jt open` can resume it later. Works for both Claude Code and Codex.
 
-The session file path can't be derived from `pwd` — when Claude Code is opened at a workspace parent and you `cd` into a subdir, `pwd` differs from the project dir Claude is registered under. Find the session file by SESSION_ID, then read its real `cwd` from the JSONL:
+The session file path can't be derived from `pwd` — when the agent is opened at a workspace parent and you `cd` into a subdir, `pwd` differs from the project dir registered for the session. Find the session rollout by SESSION_ID across both possible homes, then read the real `cwd` from the JSONL.
+
+For Claude only: append an `ai-title` record so the chat is named after the ticket. (Codex doesn't have an equivalent — it auto-derives `thread_name` from the conversation.)
 
 ```bash
-SESSION_ID="$CLAUDE_CODE_SESSION_ID"
+# Detect engine via the env vars each CLI exposes
+ENGINE=""
+SESSION_ID=""
+if [[ -n "${CLAUDE_CODE_SESSION_ID:-}" ]]; then
+  ENGINE="claude"; SESSION_ID="$CLAUDE_CODE_SESSION_ID"
+elif [[ -n "${CODEX_THREAD_ID:-}" ]]; then
+  ENGINE="codex";  SESSION_ID="$CODEX_THREAD_ID"
+fi
+
 if [[ -n "$SESSION_ID" ]]; then
-  SESSION_FILE=$(find "$HOME/.claude/projects" -maxdepth 2 -name "${SESSION_ID}.jsonl" -type f 2>/dev/null | head -1)
+  if [[ "$ENGINE" == "claude" ]]; then
+    SESSION_FILE=$(find "$HOME/.claude/projects" -maxdepth 2 -name "${SESSION_ID}.jsonl" -type f 2>/dev/null | head -1)
+    if [[ -f "$SESSION_FILE" ]]; then
+      python3 -c "import json,sys; print(json.dumps({'type':'ai-title','aiTitle':sys.argv[1],'sessionId':sys.argv[2]}))" \
+        "<ID>: <title>" "$SESSION_ID" >> "$SESSION_FILE"
+    fi
+  else
+    SESSION_FILE=$(find "${CODEX_HOME:-$HOME/.codex}/sessions" -name "rollout-*${SESSION_ID}.jsonl" -type f 2>/dev/null | head -1)
+  fi
+
+  SESSION_DIR=""
   if [[ -f "$SESSION_FILE" ]]; then
-    python3 -c "import json,sys; print(json.dumps({'type':'ai-title','aiTitle':sys.argv[1],'sessionId':sys.argv[2]}))" \
-      "<ID>: <title>" "$SESSION_ID" >> "$SESSION_FILE"
     SESSION_DIR=$(python3 -c "
 import json
 with open('$SESSION_FILE') as f:
     for line in f:
         try:
             d = json.loads(line)
-            if 'cwd' in d:
-                print(d['cwd']); break
+            cwd = d.get('cwd') or d.get('payload', {}).get('cwd')
+            if cwd:
+                print(cwd); break
         except: pass" 2>/dev/null)
   fi
   [[ -z "$SESSION_DIR" ]] && SESSION_DIR="$(pwd)"
-  printf '%s\n%s\n' "$SESSION_DIR" "$SESSION_ID" > "<TICKETS_DIR>/<ID>/.session"
+  printf '%s\n%s\n%s\n' "$ENGINE" "$SESSION_DIR" "$SESSION_ID" > "<TICKETS_DIR>/<ID>/.session"
 fi
 ```
 

@@ -6,12 +6,15 @@ set -euo pipefail
 
 JT_VERSION="0.2.0"
 JT_CONFIG="$HOME/.jt-config"
+JT_ENGINE_FILE="$HOME/.jt-engine"
 JT_UPDATE_CACHE="$HOME/.jt-update-check"
 JT_UPDATE_INTERVAL=86400  # check once per day
 JT_SYNC_CACHE="$HOME/.jt-sync-check"
 JT_SYNC_INTERVAL=3600     # refresh Linear status at most once per hour
 DEFAULT_TICKETS_DIR="$HOME/juggle-task"
 REPO="JJwilkin/juggle-task"
+CODEX_HOME_DEFAULT="$HOME/.codex"
+CLAUDE_HOME="$HOME/.claude"
 
 # Statuses that hide a ticket from the default `jt ls` / `jt open` views.
 JT_DONE_STATUSES_RE='^(archived|closed|done|cancelled|canceled|completed|duplicate)$'
@@ -21,6 +24,113 @@ _jt_tickets_dir() {
   dir=$(cat "$JT_CONFIG" 2>/dev/null || true)
   [[ -z "$dir" ]] && dir="$DEFAULT_TICKETS_DIR"
   echo "$dir"
+}
+
+# Resolve the active engine: explicit override > stored config > auto-detect.
+# Returns "claude" or "codex".
+_jt_engine() {
+  local engine="${JT_ENGINE_OVERRIDE:-}"
+  [[ -z "$engine" && -f "$JT_ENGINE_FILE" ]] && engine=$(cat "$JT_ENGINE_FILE" 2>/dev/null | tr -d '[:space:]')
+  if [[ -z "$engine" ]]; then
+    if command -v claude >/dev/null 2>&1; then
+      engine="claude"
+    elif command -v codex >/dev/null 2>&1; then
+      engine="codex"
+    else
+      engine="claude"  # fall back; commands will fail loudly with a clear error
+    fi
+  fi
+  case "$engine" in
+    claude|codex) echo "$engine" ;;
+    *) echo "claude" ;;
+  esac
+}
+
+_jt_engine_bin() {
+  case "$1" in
+    claude) echo "claude" ;;
+    codex)  echo "codex" ;;
+  esac
+}
+
+# Locate the engine's skills directory.
+_jt_engine_skills_dir() {
+  case "$1" in
+    claude) echo "$CLAUDE_HOME/skills" ;;
+    codex)  echo "${CODEX_HOME:-$CODEX_HOME_DEFAULT}/skills" ;;
+  esac
+}
+
+# Run a slash-command in a fresh interactive session, with optional inline skill body.
+# Args: <engine> <session-name> <add-dir> <slash-command-with-args>
+_jt_run_skill_fresh() {
+  local engine="$1" sess_name="$2" dir="$3" slash="$4"
+  local skill_name="${slash%% *}"  # /jt-init -> /jt-init
+  skill_name="${skill_name#/}"      # /jt-init -> jt-init
+  local skill_file
+  skill_file="$(_jt_engine_skills_dir "$engine")/$skill_name/SKILL.md"
+
+  case "$engine" in
+    claude)
+      if [[ -f "$skill_file" ]]; then
+        local skill_body
+        skill_body=$(awk 'BEGIN{p=0;n=0} /^---/{n++;if(n==2){p=1};next} p{print}' "$skill_file")
+        # Substitute $ARGUMENTS with the slash args portion only
+        local slash_args="${slash#* }"; [[ "$slash_args" == "$slash" ]] && slash_args=""
+        skill_body="${skill_body//\$ARGUMENTS/$slash_args}"
+        claude -n "$sess_name" --add-dir "$dir" \
+          --append-system-prompt "$skill_body" \
+          "$slash"
+      else
+        claude -n "$sess_name" --add-dir "$dir" "$slash"
+      fi
+      ;;
+    codex)
+      # Codex auto-discovers skills from ~/.codex/skills — no system-prompt injection needed.
+      codex --add-dir "$dir" "$slash"
+      ;;
+  esac
+}
+
+# Resume a saved session.  Args: <engine> <cwd> <uuid>
+_jt_run_resume() {
+  local engine="$1" cwd="$2" uuid="$3"
+  cd "$cwd" || return 1
+  case "$engine" in
+    claude) claude --resume "$uuid" ;;
+    codex)  codex resume "$uuid" ;;
+  esac
+}
+
+# Start a brand-new (non-skill) session with no initial prompt.
+# Args: <engine> <session-name> <add-dir>
+_jt_run_fresh() {
+  local engine="$1" sess_name="$2" dir="$3"
+  case "$engine" in
+    claude) claude -n "$sess_name" --add-dir "$dir" ;;
+    codex)  codex --add-dir "$dir" ;;
+  esac
+}
+
+# Run a slash-command in foreground, non-interactive (for `jt sync`).
+# Args: <engine> <add-dir> <slash-command>
+_jt_run_exec() {
+  local engine="$1" dir="$2" slash="$3"
+  case "$engine" in
+    claude)
+      local skill_file="$CLAUDE_HOME/skills/jt-sync/SKILL.md"
+      if [[ -f "$skill_file" ]]; then
+        local skill_body
+        skill_body=$(awk 'BEGIN{p=0;n=0} /^---/{n++;if(n==2){p=1};next} p{print}' "$skill_file")
+        claude -p --add-dir "$dir" --append-system-prompt "$skill_body" "$slash"
+      else
+        claude -p --add-dir "$dir" "$slash"
+      fi
+      ;;
+    codex)
+      codex exec --add-dir "$dir" --skip-git-repo-check "$slash"
+      ;;
+  esac
 }
 
 _jt_normalize_id() {
@@ -46,10 +156,12 @@ _jt_is_done_status() {
   [[ "$1" =~ $JT_DONE_STATUSES_RE ]]
 }
 
-# Fire a background `claude -p "/jt-sync"` to refresh Linear statuses.
+# Fire a background non-interactive /jt-sync to refresh Linear statuses.
 # TTL-gated so it runs at most once per JT_SYNC_INTERVAL.
 _jt_background_sync() {
-  command -v claude >/dev/null 2>&1 || return 0
+  local engine
+  engine=$(_jt_engine)
+  command -v "$(_jt_engine_bin "$engine")" >/dev/null 2>&1 || return 0
 
   local now cached_time
   now=$(date +%s)
@@ -60,19 +172,17 @@ _jt_background_sync() {
     fi
   fi
 
+  local skills_dir
+  skills_dir=$(_jt_engine_skills_dir "$engine")
+  [[ -f "$skills_dir/jt-sync/SKILL.md" ]] || return 0
+
   local dir
   dir=$(_jt_tickets_dir)
-  local skill_file="$HOME/.claude/skills/jt-sync/SKILL.md"
-  [[ -f "$skill_file" ]] || return 0
 
   # Pre-stamp the cache so concurrent commands don't all fire syncs.
   printf '%s\n' "$now" > "$JT_SYNC_CACHE"
 
-  (
-    local skill_body
-    skill_body=$(awk 'BEGIN{p=0;n=0} /^---/{n++;if(n==2){p=1};next} p{print}' "$skill_file")
-    claude -p --add-dir "$dir" --append-system-prompt "$skill_body" "/jt-sync" >/dev/null 2>&1
-  ) &
+  ( _jt_run_exec "$engine" "$dir" "/jt-sync" >/dev/null 2>&1 ) &
   disown 2>/dev/null || true
 }
 
@@ -183,23 +293,25 @@ _jt_checkout() {
 
 cmd_help() {
   cat <<EOF
-juggle (jt) v${JT_VERSION} — ticket context manager for Claude Code
+juggle (jt) v${JT_VERSION} — ticket context manager for Claude Code & Codex
 
 Usage:
-  jt init   <ticket> [--project <id>]   create ticket context (launches Claude)
-  jt update                              save session progress to CONTEXT.md (launches Claude)
-  jt open   [ticket] [--all]             checkout branch + launch Claude (include completed with --all)
+  jt init   <ticket> [--project <id>]   create ticket context (launches the active engine)
+  jt update                              save session progress to CONTEXT.md
+  jt open   [ticket] [--all]             resume the session (include completed with --all)
   jt ls     [--all]                      list active tickets (include completed with --all)
   jt sync                                refresh ticket statuses from Linear (foreground)
   jt project init <id-or-url>            create a new project / epic
   jt project ls                          list all projects
   jt project show <id>                   show a project's PROJECT.md
+  jt engine                              show active engine (claude or codex)
+  jt engine set <claude|codex>           pin a default engine
   jt upgrade                             upgrade jt to the latest version
   jt config                              show current tickets directory
   jt config set <path>                   set tickets directory
   jt help                                show this message
 
-Claude skills: /jt-init, /jt-update, /jt-project-init, /jt-sync
+Skills (installed for both engines): /jt-init, /jt-update, /jt-project-init, /jt-sync
 
 Docs: https://github.com/JJwilkin/juggle-task
 EOF
@@ -224,24 +336,15 @@ cmd_init() {
   done
   [[ -z "$ticket" ]] && { echo "Usage: jt init <TICKET-ID or URL> [--project <id>]"; exit 1; }
 
-  local dir
+  local dir engine
   dir=$(_jt_tickets_dir)
-  local skill_file="$HOME/.claude/skills/jt-init/SKILL.md"
+  engine=$(_jt_engine)
   local args="$ticket"
   [[ -n "$project_id" ]] && args="$args --project $project_id"
 
-  echo "Launching Claude to initialize $ticket${project_id:+ (project: $project_id)}..."
+  echo "Launching $engine to initialize $ticket${project_id:+ (project: $project_id)}..."
   echo ""
-  if [[ -f "$skill_file" ]]; then
-    local skill_body
-    skill_body=$(awk 'BEGIN{p=0;n=0} /^---/{n++;if(n==2){p=1};next} p{print}' "$skill_file")
-    skill_body="${skill_body//\$ARGUMENTS/$args}"
-    claude -n "$ticket" --add-dir "$dir" \
-      --append-system-prompt "$skill_body" \
-      "/jt-init $args"
-  else
-    claude -n "$ticket" --add-dir "$dir" "/jt-init $args"
-  fi
+  _jt_run_skill_fresh "$engine" "$ticket" "$dir" "/jt-init $args"
 }
 
 cmd_project() {
@@ -254,19 +357,11 @@ cmd_project() {
     init)
       local arg="${1:-}"
       [[ -z "$arg" ]] && { echo "Usage: jt project init <ID-or-Linear-URL>"; exit 1; }
-      local skill_file="$HOME/.claude/skills/jt-project-init/SKILL.md"
-      echo "Launching Claude to initialize project $arg..."
+      local engine
+      engine=$(_jt_engine)
+      echo "Launching $engine to initialize project $arg..."
       echo ""
-      if [[ -f "$skill_file" ]]; then
-        local skill_body
-        skill_body=$(awk 'BEGIN{p=0;n=0} /^---/{n++;if(n==2){p=1};next} p{print}' "$skill_file")
-        skill_body="${skill_body//\$ARGUMENTS/$arg}"
-        claude -n "Project: $arg" --add-dir "$dir" \
-          --append-system-prompt "$skill_body" \
-          "/jt-project-init $arg"
-      else
-        claude -n "Project: $arg" --add-dir "$dir" "/jt-project-init $arg"
-      fi
+      _jt_run_skill_fresh "$engine" "Project: $arg" "$dir" "/jt-project-init $arg"
       ;;
     ls)
       local found=0
@@ -321,11 +416,15 @@ cmd_project() {
 }
 
 cmd_update() {
-  local dir
+  local dir engine
   dir=$(_jt_tickets_dir)
-  echo "Launching Claude to save session context..."
+  engine=$(_jt_engine)
+  echo "Launching $engine to save session context..."
   echo ""
-  claude --add-dir "$dir" "/jt-update $*"
+  case "$engine" in
+    claude) claude --add-dir "$dir" "/jt-update $*" ;;
+    codex)  codex --add-dir "$dir" "/jt-update $*" ;;
+  esac
 }
 
 cmd_ls() {
@@ -425,42 +524,45 @@ cmd_open() {
   local session_file
   session_file="$(dirname "$context_file")/.session"
 
-  # Resume the saved session: cd to its original project dir then --resume by UUID
+  # .session formats supported (in order of preference):
+  #   3-line: <engine>\n<cwd>\n<uuid>
+  #   2-line (legacy): <cwd>\n<uuid>  -> defaults to claude engine
   if [[ -f "$session_file" ]]; then
-    local session_dir session_uuid
-    session_dir=$(head -1 "$session_file")
-    session_uuid=$(sed -n '2p' "$session_file")
-    if [[ -n "$session_dir" && -n "$session_uuid" && -d "$session_dir" ]]; then
-      echo "Resuming session for $ticket_id..."
+    local line1 line2 line3 sess_engine sess_dir sess_uuid
+    line1=$(sed -n '1p' "$session_file")
+    line2=$(sed -n '2p' "$session_file")
+    line3=$(sed -n '3p' "$session_file")
+    if [[ "$line1" == "claude" || "$line1" == "codex" ]]; then
+      sess_engine="$line1"; sess_dir="$line2"; sess_uuid="$line3"
+    else
+      sess_engine="claude"; sess_dir="$line1"; sess_uuid="$line2"
+    fi
+    if [[ -n "$sess_dir" && -n "$sess_uuid" && -d "$sess_dir" ]]; then
+      echo "Resuming $sess_engine session for $ticket_id..."
       echo ""
-      cd "$session_dir" && claude --resume "$session_uuid"
+      _jt_run_resume "$sess_engine" "$sess_dir" "$sess_uuid"
       return
     fi
   fi
 
-  # No saved session — start a fresh named session
-  local session_name
+  # No saved session — start a fresh named session in the active engine
+  local engine session_name
+  engine=$(_jt_engine)
   session_name=$(head -1 "$context_file" | sed 's/^# //' | sed 's/ — Agent Context$//')
 
-  echo "Starting new session for $ticket_id..."
+  echo "Starting new $engine session for $ticket_id..."
   echo ""
-  claude -n "$session_name" --add-dir "$dir"
+  _jt_run_fresh "$engine" "$session_name" "$dir"
 }
 
 cmd_sync() {
-  local dir
+  local dir engine
   dir=$(_jt_tickets_dir)
-  local skill_file="$HOME/.claude/skills/jt-sync/SKILL.md"
-  echo "Syncing ticket statuses from Linear..."
+  engine=$(_jt_engine)
+  echo "Syncing ticket statuses from Linear via $engine..."
   echo ""
   rm -f "$JT_SYNC_CACHE"  # foreground sync overrides any TTL gate
-  if [[ -f "$skill_file" ]]; then
-    local skill_body
-    skill_body=$(awk 'BEGIN{p=0;n=0} /^---/{n++;if(n==2){p=1};next} p{print}' "$skill_file")
-    claude -p --add-dir "$dir" --append-system-prompt "$skill_body" "/jt-sync"
-  else
-    claude -p --add-dir "$dir" "/jt-sync"
-  fi
+  _jt_run_exec "$engine" "$dir" "/jt-sync"
   printf '%s\n' "$(date +%s)" > "$JT_SYNC_CACHE"
 }
 
@@ -476,6 +578,43 @@ cmd_upgrade() {
     echo "Upgrade failed. Check your connection and try again."
     exit 1
   fi
+}
+
+cmd_engine() {
+  local subcmd="${1:-}"
+  case "$subcmd" in
+    set)
+      local new="${2:-}"
+      [[ "$new" != "claude" && "$new" != "codex" ]] && {
+        echo "Usage: jt engine set <claude|codex>"
+        exit 1
+      }
+      printf '%s\n' "$new" > "$JT_ENGINE_FILE"
+      echo "Engine set to: $new"
+      ;;
+    reset|clear)
+      rm -f "$JT_ENGINE_FILE"
+      echo "Engine setting cleared (will auto-detect)."
+      ;;
+    "")
+      local current
+      current=$(_jt_engine)
+      echo "Active engine: $current"
+      if [[ -f "$JT_ENGINE_FILE" ]]; then
+        echo "Source:        $JT_ENGINE_FILE"
+      else
+        echo "Source:        auto-detect (claude > codex)"
+      fi
+      echo ""
+      echo "Available CLIs on PATH:"
+      command -v claude >/dev/null 2>&1 && echo "  claude  $(claude --version 2>/dev/null | head -1)"
+      command -v codex >/dev/null 2>&1  && echo "  codex   $(codex --version 2>/dev/null | head -1)"
+      ;;
+    *)
+      echo "Usage: jt engine [set <claude|codex> | reset]"
+      exit 1
+      ;;
+  esac
 }
 
 cmd_config() {
@@ -520,6 +659,7 @@ main() {
     ls)             cmd_ls "$@" ;;
     sync)           cmd_sync ;;
     project)        cmd_project "$@" ;;
+    engine)         cmd_engine "$@" ;;
     upgrade)        cmd_upgrade ;;
     config)         cmd_config "$@" ;;
     help|--help|-h) cmd_help ;;
